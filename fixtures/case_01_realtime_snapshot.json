@@ -1,0 +1,14 @@
+{
+  "_comment": "合成樣本(Case 01 好資料)。模擬券商即時 snapshot API 於同一時刻的回傳:帶完整 timestamp,last 反映盤中 +6.8% 的真實價格。合格的盤中即時源必須有 timestamp 欄位,且日期 = 今日、時間距 now 在容忍範圍內。",
+  "stock_id": "6274",
+  "ts": "2026-05-29T10:06:48+08:00",
+  "last": 1645.0,
+  "bid": 1640.0,
+  "ask": 1645.0,
+  "open": 1548.0,
+  "high": 1650.0,
+  "low": 1542.0,
+  "prev_close": 1540.0,
+  "change_pct": 6.8,
+  "total_volume": 5214
+}

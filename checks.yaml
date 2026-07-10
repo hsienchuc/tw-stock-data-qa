@@ -1,0 +1,150 @@
+# 台股資料管線 QA 測試包 — 免費樣本檢查規則
+# 格式: 每條規則 = id / description / severity / applies_to(資料源) / check(邏輯描述) / fixtures / case
+# 這些規則是「來源無關 invariant」: 綁資料行為,不綁任何特定架構。
+# check 欄位為邏輯描述(pseudo-logic),各團隊可落地成 pandera / great_expectations / 自寫 assert。
+
+version: "free-sample-1.0"
+market: TW
+
+checks:
+
+  # ── Case 01: 盤中 stale baseline ──────────────────────────────
+
+  - id: stale_baseline_date_mismatch
+    name: 即時 baseline 資料日期必須等於當前交易日
+    description: >
+      任何在盤中被當作「即時價格 baseline」使用的資料,其資料日期(date 欄或
+      timestamp 的日期部分)必須等於今天的交易日。EOD 源盤中回傳 T-1 收盤是
+      該源的正常行為,不會報錯,必須由呼叫端檢查。
+    severity: critical
+    applies_to: [FinMind, TWSE_OpenAPI, Yahoo_Finance, any_eod_source]
+    check: |
+      given: market_session in (RTH)            # 台股 09:00-13:30
+      when:  price_record used as realtime_baseline
+      then:  price_record.date == current_trading_day(exchange_calendar)
+      on_fail: block_pipeline + alert            # 不得降級續跑
+    fixtures:
+      fail: fixtures/case_01_eod_api_response.json
+      pass: fixtures/case_01_realtime_snapshot.json
+    case: case_01_intraday_stale_baseline.md
+
+  - id: intraday_requires_realtime_source
+    name: 盤中路徑禁止出現 EOD 角色資料源
+    description: >
+      每個資料源需標記角色(realtime / eod)。角色為 eod 的源(FinMind 日線、
+      TWSE OpenAPI、Yahoo Finance)出現在盤中即時 code path 即 fail,不需看
+      資料內容。無 timestamp 欄位的源一律不得標記為 realtime。另注意部分
+      中介源分鐘資料有 15 分鐘以上 lag、當日資料為盤後批次上架。
+    severity: critical
+    applies_to: [all_sources]
+    check: |
+      given: market_session in (RTH)
+      when:  code_path.purpose == realtime
+      then:  source.role == realtime
+             and source.schema contains timestamp_field
+             and now() - record.timestamp <= freshness_limit   # 建議 5 min,日內策略 1 min
+    fixtures:
+      pass: fixtures/case_01_realtime_snapshot.json
+    case: case_01_intraday_stale_baseline.md
+
+  # ── Case 02: 主檔漏整個交易所 ─────────────────────────────────
+
+  - id: universe_exchange_coverage
+    name: 全市場主檔必須同時覆蓋 TSE 與 OTC
+    description: >
+      台灣市場上市歸 TWSE、上櫃歸 TPEX,兩機構兩套 API,無單一端點回全市場。
+      宣稱「全市場」的主檔,exchange 欄 distinct 值必須同時含 TSE 與 OTC;
+      建檔時必須寫入來源標記,無標記的主檔視為不可稽核。
+    severity: critical
+    applies_to: [TWSE_OpenAPI, TPEX_OpenAPI]
+    check: |
+      given: universe.scope == full_market
+      then:  distinct(universe.exchange) superset_of {TSE, OTC}
+             and all rows have non-empty exchange tag
+    fixtures:
+      fail: fixtures/case_02_universe_twse_only.csv
+      pass: fixtures/case_02_universe_merged.csv
+    case: case_02_tpex_missing_universe.md
+
+  - id: known_otc_probe_nonzero
+    name: 已知上櫃探針標的查詢結果不得為零
+    description: >
+      「查無資料回 0 筆」語意合法,靠筆數看不出覆蓋缺口。維護 3-5 檔確定有
+      上櫃掛牌商品的探針標的,每次主檔重建後查詢,任一探針回 0 即 fail。
+      探針 fail 時先人工確認(下市/到期屬合法歸零)再更新清單。
+    severity: high
+    applies_to: [any_universe_master]
+    check: |
+      given: probes = configured_otc_underlyings   # 例: [6274, 2337, 2492]
+      after: universe rebuild
+      then:  for each p in probes: count(universe where underlying_code == p) > 0
+    fixtures:
+      fail: fixtures/case_02_universe_twse_only.csv
+      pass: fixtures/case_02_universe_merged.csv
+    case: case_02_tpex_missing_universe.md
+
+  - id: universe_count_floor
+    name: 主檔筆數對歷史基準的掉幅上限
+    description: >
+      主檔總筆數對照 30 日中位數,單日掉幅超過 10% 即告警。結構性缺口
+      (實際案例: 23.7%)有基準比對第一天就會被抓到;商品日常發行/到期造成的
+      1-3% 波動屬正常。
+    severity: high
+    applies_to: [any_universe_master]
+    check: |
+      then: count(universe_today) >= median(count(universe), last_30d) * 0.90
+    case: case_02_tpex_missing_universe.md
+
+  # ── Case 03: 非交易日假訊號 ──────────────────────────────────
+
+  - id: signal_date_is_trading_day
+    name: 訊號/行情類產出的日期必須為交易日
+    description: >
+      任何宣稱屬於某交易日的產出(訊號、榜單、日報),其日期必須存在於交易日曆
+      且 is_trading_day 為真。在寫入端(ingest)強制,不只在排程端 —— 排程端
+      擋板擋不住手動補跑與時鐘錯亂。歷史庫需可全表掃描驗證違規筆數為 0。
+    severity: critical
+    applies_to: [any_signal_output]
+    check: |
+      when: ingest(record with signal_date)
+      then: calendar[record.signal_date].is_trading_day == true
+      on_fail: reject_record + alert
+    fixtures:
+      fail: fixtures/case_03_signals_bad.csv
+      pass: fixtures/case_03_signals_good.csv
+      calendar: fixtures/case_03_trading_calendar.csv
+    case: case_03_non_trading_day_signals.md
+
+  - id: calendar_confirmed_absence
+    name: 休市判定需正面證據,拉不到資料不等於休市
+    description: >
+      判定「今日休市」必須以正面證據為準(官方日曆標記、或行情探測確認全市場
+      無成交)。官方源有延遲公布的實例 —— 用「拉不到 = 休市」邏輯會把真交易日
+      誤判成假日造成資料洞。近幾日資料缺席只告警不擋。
+    severity: high
+    applies_to: [exchange_calendar, any_eod_source]
+    check: |
+      when: deciding is_trading_day == false for date D
+      then: evidence in (official_calendar_entry, market_wide_no_trade_probe)
+            and evidence != data_fetch_returned_empty
+      grace: D within last N days and data missing -> WARN not FAIL
+    fixtures:
+      calendar: fixtures/case_03_trading_calendar.csv
+    case: case_03_non_trading_day_signals.md
+
+  - id: scheduler_trading_day_gate
+    name: 每日排程開頭必查交易日曆並留痕跳過
+    description: >
+      排程規則限定平日(MON-FRI)只是第一層,擋不住颱風/選舉/連假調整。
+      第二層: job 開頭查交易日曆,非交易日明確 log「market closed, skipped」
+      後 exit —— 讓「正常休市沒跑」與「掛了沒跑」在監控端可區分。
+    severity: high
+    applies_to: [any_daily_scheduled_job]
+    check: |
+      at: job start
+      then: if not calendar[today].is_trading_day:
+              log("market closed ({note}), skipped") ; exit 0_with_skip_marker
+      audit: every daily job has this gate + schedule rule excludes weekends
+    fixtures:
+      calendar: fixtures/case_03_trading_calendar.csv
+    case: case_03_non_trading_day_signals.md
